@@ -9,6 +9,9 @@ import cv2
 import numpy as np
 import mvsdk
 from PIL import Image, ImageTk
+# EPICS soft IOC support
+from softioc import softioc, builder
+import cothread
 
 
 class CameraControlApp:
@@ -39,6 +42,16 @@ class CameraControlApp:
         # 图像显示相关
         self.current_frame = None
         self.display_frame = None
+
+        # EPICS PV handles (will be created after camera is opened)
+        self.frame_pv = None
+        self.width_pv = None
+        self.height_pv = None
+        self.count_pv = None
+        self.timestamp_pv = None
+
+        # 用于 EPICS 发布的帧计数（避免与用于 FPS 的 self.frame_count 混淆）
+        self.epics_frame_counter = 0
 
         self.setup_gui()
 
@@ -264,6 +277,76 @@ class CameraControlApp:
             # 分配RGB buffer
             self.pFrameBuffer = mvsdk.CameraAlignMalloc(FrameBufferSize, 16)
 
+            # --- 初始化并创建 EPICS PV（尝试兼容多种 builder API） ---
+            try:
+                # 设备名前缀，可根据需要修改
+                builder.SetDeviceName("CAMERA")
+
+                max_w = self.cap.sResolutionRange.iWidthMax
+                max_h = self.cap.sResolutionRange.iHeightMax
+                channels = 1 if self.monoCamera else 3
+                max_len = max_w * max_h * channels
+
+                # 尝试创建 waveform PV（不同版本的 softioc builder 名称可能不同）
+                try:
+                    self.frame_pv = builder.WaveformOut('Frame', datatype=np.uint8, length=max_len,
+                                                         initial_value=np.zeros(max_len, dtype=np.uint8))
+                except Exception:
+                    try:
+                        self.frame_pv = builder.waveformOut('Frame', datatype=np.uint8, length=max_len,
+                                                            initial_value=np.zeros(max_len, dtype=np.uint8))
+                    except Exception:
+                        self.frame_pv = None
+
+                # 数值型元数据（使用 aOut 或 longOut）
+                try:
+                    self.width_pv = builder.aOut('Width', initial_value=max_w)
+                except Exception:
+                    try:
+                        self.width_pv = builder.longOut('Width', initial_value=max_w)
+                    except Exception:
+                        self.width_pv = None
+
+                try:
+                    self.height_pv = builder.aOut('Height', initial_value=max_h)
+                except Exception:
+                    try:
+                        self.height_pv = builder.longOut('Height', initial_value=max_h)
+                    except Exception:
+                        self.height_pv = None
+
+                try:
+                    self.count_pv = builder.aOut('FrameCounter', initial_value=0)
+                except Exception:
+                    self.count_pv = None
+
+                # 时间戳（字符串 PV）
+                try:
+                    self.timestamp_pv = builder.stringOut('Timestamp', initial_value='')
+                except Exception:
+                    try:
+                        self.timestamp_pv = builder.StringOut('Timestamp', initial_value='')
+                    except Exception:
+                        self.timestamp_pv = None
+
+                # 完成 builder 配置并启动 IOC
+                try:
+                    builder.LoadDatabase()
+                    softioc.iocInit()
+                    self.log_message('softIOC 已启动，EPICS PV 已创建（如果支持）')
+                except Exception as e:
+                    self.log_message(f'softIOC 启动失败: {e}')
+
+                # 启动发布线程（使用 cothread，以免与 tkinter/main thread 并发问题）
+                try:
+                    cothread.Spawn(self._pv_update_loop)
+                except Exception as e:
+                    # 如果 Spawn 失败，仍然继续运行应用，但记录日志
+                    self.log_message(f'启动 PV 发布线程失败: {e}')
+            except Exception as e:
+                self.log_message(f'创建 EPICS PV 失败: {e}')
+
+
             self.camera_status_label.config(text="已连接", foreground="green")
             self.camera_name_label.config(text=f"相机: {cam_name}")
             self.log_message("相机连接成功")
@@ -370,6 +453,52 @@ class CameraControlApp:
 
                 # 更新当前帧
                 self.current_frame = frame.copy()
+                # 更新 EPICS 帧计数（在采集线程中递增），并每帧同步写入所有 PV
+                try:
+                    self.epics_frame_counter += 1
+
+                    # 写入 waveform 和元数据（同步每帧更新）
+                    try:
+                        if self.frame_pv is not None:
+                            # 去掉多余的通道维度并展平
+                            arr = self.current_frame.squeeze()
+                            if arr.dtype != np.uint8:
+                                arr = arr.astype(np.uint8)
+                            flat = arr.flatten()
+                            # 写入波形 PV（注意长度应与创建时一致）
+                            self.frame_pv.set(flat)
+                    except Exception as e:
+                        # 记录但不阻塞采集
+                        self.log_message(f"每帧写 Frame PV 失败: {e}")
+
+                    try:
+                        if self.width_pv is not None:
+                            self.width_pv.set(int(frame.shape[1]))
+                    except Exception:
+                        pass
+                    try:
+                        if self.height_pv is not None:
+                            self.height_pv.set(int(frame.shape[0]))
+                    except Exception:
+                        pass
+                    try:
+                        if self.count_pv is not None:
+                            self.count_pv.set(int(self.epics_frame_counter))
+                    except Exception:
+                        pass
+                    try:
+                        if self.timestamp_pv is not None:
+                            self.timestamp_pv.set(time.strftime("%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                # DEBUG: 打印当前帧信息（dtype, shape, ndim）
+                try:
+                    print(self.current_frame.dtype, self.current_frame.shape, self.current_frame.ndim)
+                except Exception:
+                    pass
 
                 # 更新实时帧率
                 self.update_fps()
@@ -415,6 +544,20 @@ class CameraControlApp:
 
         except Exception as e:
             self.log_message(f"更新显示失败: {str(e)}")
+
+    def _pv_update_loop(self):
+        """周期性地将 self.current_frame 发布为 EPICS waveform PV（在 cothread 环境中运行）"""
+        # PV 循环现在只做轻量保活或错误记录，无需每帧写入（capture_loop 已负责同步写入）
+        while True:
+            try:
+                # 可在此加入周期性健康检查或其他低频任务
+                cothread.Sleep(1.0)
+            except Exception as e:
+                self.log_message(f"PV 发布循环错误: {e}")
+                try:
+                    cothread.Sleep(0.5)
+                except Exception:
+                    time.sleep(0.5)
 
     def browse_save_path(self):
         """浏览保存路径"""
